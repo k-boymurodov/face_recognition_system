@@ -1,0 +1,10 @@
+opencv-python
+face_recognition
+numpy
+dlib
+gTTS
+pygame
+Pillow
+python-dotenv
+mysql-connector-python
+pyaudio
