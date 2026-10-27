@@ -6,6 +6,7 @@ from typing import Any, Callable
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 
 from backend.config import settings
 from backend.database import transaction
@@ -14,20 +15,24 @@ COOKIE_NAME = "attendance_session"
 _attempts: dict[str, tuple[int, float]] = {}
 _attempts_lock = Lock()
 
+# Foydalanuvchi topilmasa ham bcrypt tekshiruvi bajariladi (vaqt bo'yicha login aniqlanmasligi uchun).
+_DUMMY_HASH = bcrypt.hashpw(b"dummy-password", bcrypt.gensalt())
+
 
 def bootstrap_admin() -> None:
     if not settings.admin_password:
         return
-    password_hash = bcrypt.hashpw(
-        settings.admin_password.encode("utf-8"), bcrypt.gensalt()
-    ).decode("ascii")
     with transaction() as (_, cursor):
         cursor.execute("SELECT id FROM web_users WHERE username = %s", (settings.admin_username,))
-        if cursor.fetchone() is None:
-            cursor.execute(
-                "INSERT INTO web_users (username, password_hash, role) VALUES (%s, %s, 'admin')",
-                (settings.admin_username, password_hash),
-            )
+        if cursor.fetchone() is not None:
+            return
+        password_hash = bcrypt.hashpw(
+            settings.admin_password.encode("utf-8"), bcrypt.gensalt()
+        ).decode("ascii")
+        cursor.execute(
+            "INSERT INTO web_users (username, password_hash, role) VALUES (%s, %s, 'admin')",
+            (settings.admin_username, password_hash),
+        )
 
 
 def _check_rate_limit(client_key: str) -> None:
@@ -68,12 +73,11 @@ def authenticate(username: str, password: str, client_key: str) -> dict[str, Any
             detail=detail,
         ) from exc
 
-    valid = False
-    if user:
-        try:
-            valid = bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("ascii"))
-        except (ValueError, TypeError):
-            valid = False
+    hash_bytes = user["password_hash"].encode("ascii") if user else _DUMMY_HASH
+    try:
+        valid = bcrypt.checkpw(password.encode("utf-8"), hash_bytes) and user is not None
+    except (ValueError, TypeError):
+        valid = False
     if not valid:
         _record_failure(client_key)
         raise HTTPException(status_code=401, detail="Login yoki parol noto'g'ri.")
@@ -107,26 +111,46 @@ def clear_session(response: Response) -> None:
     response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="strict")
 
 
-async def current_user(request: Request) -> dict[str, Any]:
-    token = request.cookies.get(COOKIE_NAME)
-    user = read_session(token)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Tizimga kiring.")
-    return user
-
-
 def read_session(token: str | None) -> dict[str, Any] | None:
     if not token or not settings.jwt_secret:
         return None
     try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "sub"]},
+        )
         return {
             "id": int(payload["sub"]),
             "username": payload["username"],
             "role": payload["role"],
         }
-    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as exc:
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         return None
+
+
+def _load_active_user(user_id: int) -> dict[str, Any] | None:
+    with transaction() as (_, cursor):
+        cursor.execute(
+            "SELECT id, username, role FROM web_users WHERE id = %s AND active = TRUE",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    return {"id": int(row["id"]), "username": row["username"], "role": row["role"]}
+
+
+async def current_user(request: Request) -> dict[str, Any]:
+    # Rol va faollik har so'rovda bazadan olinadi: o'chirilgan yoki roli o'zgargan foydalanuvchi darhol ta'sir qiladi.
+    session = read_session(request.cookies.get(COOKIE_NAME))
+    if session is None:
+        raise HTTPException(status_code=401, detail="Tizimga kiring.")
+    user = await run_in_threadpool(_load_active_user, session["id"])
+    if user is None:
+        raise HTTPException(status_code=401, detail="Tizimga kiring.")
+    return user
 
 
 def require_roles(*roles: str) -> Callable[..., Any]:

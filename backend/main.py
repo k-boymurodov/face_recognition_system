@@ -274,7 +274,7 @@ def api_health():
 
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, request: Request, response: Response):
-    client_key = request.client.host if request.client else "unknown"
+    client_key = f"{request.client.host if request.client else 'unknown'}|{payload.username.lower()}"
     user = authenticate(payload.username, payload.password, client_key)
     set_session(response, user)
     return {"user": user}

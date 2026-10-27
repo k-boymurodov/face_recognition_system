@@ -1,11 +1,16 @@
 from dataclasses import dataclass
+from io import BytesIO
 
 import cv2
 import face_recognition
 import numpy as np
+from PIL import Image
 
 from backend.config import settings
 from backend.database import transaction
+
+# Eng yaqin va ikkinchi eng yaqin xodim orasidagi minimal masofa farqi (o'xshash yuzlarni adashtirmaslik uchun).
+MATCH_MARGIN = 0.05
 
 
 @dataclass
@@ -19,12 +24,19 @@ def decode_image(image_bytes: bytes) -> np.ndarray:
         raise ValueError("Rasm bo'sh yuborildi.")
     if len(image_bytes) > 5 * 1024 * 1024:
         raise ValueError("Rasm hajmi 5 MB dan oshmasligi kerak.")
+    # O'lcham rasmni to'liq ochishdan OLDIN tekshiriladi (kichik fayl, lekin ulkan piksel sonli rasmdan himoya).
+    try:
+        with Image.open(BytesIO(image_bytes)) as probe:
+            fmt, (width, height) = probe.format, probe.size
+    except Exception:
+        raise ValueError("Rasm formati JPEG yoki PNG bo'lishi kerak.")
+    if fmt not in {"JPEG", "PNG"}:
+        raise ValueError("Rasm formati JPEG yoki PNG bo'lishi kerak.")
+    if width < 160 or height < 120 or width > 4096 or height > 4096:
+        raise ValueError("Rasm o'lchami qo'llab-quvvatlanmaydi.")
     image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Rasm formati JPEG yoki PNG bo'lishi kerak.")
-    height, width = image.shape[:2]
-    if width < 160 or height < 120 or width > 4096 or height > 4096:
-        raise ValueError("Rasm o'lchami qo'llab-quvvatlanmaydi.")
     return image
 
 
@@ -75,7 +87,7 @@ def known_face_encodings(
     for employee in employees:
         if exclude_employee_id is not None and int(employee["id"]) == exclude_employee_id:
             continue
-        blob = bytes(employee["face_encoding"])
+        blob = bytes(employee["face_encoding"] or b"")
         if len(blob) != 128 * np.dtype(np.float64).itemsize:
             continue
         encoding = np.frombuffer(blob, dtype=np.float64)
@@ -105,6 +117,9 @@ def match_employee(encoding: np.ndarray):
     best_index = int(np.argmin(distances))
     distance = float(distances[best_index])
     if distance > settings.face_tolerance:
+        return None
+    # Ikkinchi eng yaqin xodim deyarli bir xil masofada bo'lsa, adashmaslik uchun tanimaymiz.
+    if len(distances) > 1 and float(np.partition(distances, 1)[1]) - distance < MATCH_MARGIN:
         return None
     employee_id, name, _ = known[best_index]
     return {
