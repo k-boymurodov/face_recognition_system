@@ -25,6 +25,13 @@ class UserCreate(BaseModel):
             raise ValueError("Login bo'sh bo'lishi mumkin emas")
         return value
 
+    @field_validator("password")
+    @classmethod
+    def password_max_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("Parol 72 baytdan oshmasin.")
+        return value
+
 
 class EmployeeCreate(BaseModel):
     employee_code: str = Field(min_length=1, max_length=64)
