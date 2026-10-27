@@ -11,10 +11,10 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 import bcrypt
-import mysql.connector
 from mysql.connector import IntegrityError
+from pydantic import BaseModel
 
 from backend.auth import (
     COOKIE_NAME,
@@ -34,6 +34,10 @@ from backend.schemas import EmployeeCreate, EmployeeUpdate, LoginRequest, UserCr
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("attendance.web")
 TZ = ZoneInfo("Asia/Tashkent")
+MAX_IMAGE = 5 * 1024 * 1024
+SESSION_TTL = 1800
+
+# Kamera sessiyalari bitta jarayon xotirasida saqlanadi: uvicorn'ni faqat 1 worker bilan ishga tushiring.
 _sessions: dict[str, tuple[int, float, float]] = {}
 _sessions_lock = Lock()
 
@@ -59,6 +63,10 @@ app.add_middleware(
 )
 
 
+class CameraStop(BaseModel):
+    session_id: str
+
+
 @app.exception_handler(DatabaseUnavailable)
 async def database_error_handler(_: Request, exc: DatabaseUnavailable):
     message = str(exc)
@@ -68,6 +76,25 @@ async def database_error_handler(_: Request, exc: DatabaseUnavailable):
     else:
         detail = "MySQL bazasiga ulanib bo'lmadi. DB_HOST, DB_USER, DB_PASSWORD va DB_NAME qiymatlarini tekshiring."
     return JSONResponse(status_code=503, content={"detail": detail})
+
+
+async def _read_image(image: UploadFile) -> bytes:
+    data = await image.read(MAX_IMAGE + 1)
+    if len(data) > MAX_IMAGE:
+        raise HTTPException(status_code=413, detail="Rasm hajmi 5 MB dan oshmasin.")
+    return data
+
+
+def _csv_safe(value):
+    # Excel formula injection'dan himoya: =, +, -, @ bilan boshlangan matnni oldiga ' qo'yamiz.
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
+def _day_bounds(day: date) -> tuple[datetime, datetime]:
+    start = datetime.combine(day, time.min)
+    return start, start + timedelta(days=1)
 
 
 def _public_employee(row: dict) -> dict:
@@ -81,8 +108,13 @@ def _public_employee(row: dict) -> dict:
         "status": row.get("status") or "active",
         "created_at": row.get("created_at"),
         "face_registered_at": row.get("face_registered_at"),
-        "has_face": bool(row.get("face_encoding")),
+        "has_face": bool(row.get("has_face")),
     }
+
+
+def _purge_expired_sessions(now: float) -> None:
+    for key in [k for k, v in _sessions.items() if v[1] < now]:
+        _sessions.pop(key, None)
 
 
 def _ensure_camera_session(session_id: str | None, user_id: int, enforce_interval: bool = False) -> None:
@@ -91,19 +123,20 @@ def _ensure_camera_session(session_id: str | None, user_id: int, enforce_interva
     now = monotonic()
     with _sessions_lock:
         session = _sessions.get(session_id)
-        if not session or session[0] != user_id or session[1] < monotonic():
+        if not session or session[0] != user_id or session[1] < now:
             _sessions.pop(session_id, None)
             raise HTTPException(status_code=409, detail="Kamera sessiyasi tugagan. Qayta boshlang.")
         interval = max(settings.frame_interval_ms, 500) / 1000
         if enforce_interval and now - session[2] < interval:
             raise HTTPException(status_code=429, detail="Kadrlar orasidagi minimal vaqt saqlansin.")
         last_frame = now if enforce_interval else session[2]
-        _sessions[session_id] = (user_id, now + 1800, last_frame)
+        _sessions[session_id] = (user_id, now + SESSION_TTL, last_frame)
 
 
 def _attendance_event(employee: dict, confidence: float) -> dict:
     now = datetime.now(TZ).replace(tzinfo=None, microsecond=0)
     today = now.date()
+    day_start, day_end = _day_bounds(today)
     with transaction() as (_, cursor):
         cursor.execute(
             "SELECT id FROM employees WHERE id = %s AND status = 'active' FOR UPDATE",
@@ -113,9 +146,9 @@ def _attendance_event(employee: dict, confidence: float) -> dict:
             raise HTTPException(status_code=404, detail="Xodim faol emas yoki topilmadi.")
         cursor.execute(
             """SELECT action, timestamp FROM attendance_log
-               WHERE employee_id = %s AND DATE(timestamp) = %s
+               WHERE employee_id = %s AND timestamp >= %s AND timestamp < %s
                ORDER BY id DESC LIMIT 1""",
-            (employee["id"], today),
+            (employee["id"], day_start, day_end),
         )
         latest = cursor.fetchone()
         if latest:
@@ -197,9 +230,13 @@ def _report_rows(start: date, end: date, employee_id: int | None = None, departm
         )
         attendance = {(row["id"], row["date"]): row for row in cursor.fetchall()}
 
+    today = datetime.now(TZ).date()
     results = []
     day = start
     while day <= end:
+        # Kelajak kunlar "absent" bo'lib chiqmasligi uchun bugundan keyingisi o'tkazib yuboriladi.
+        if day > today:
+            break
         if day.weekday() in settings.working_days:
             for employee in employees:
                 row = attendance.get((employee["id"], day))
@@ -283,29 +320,30 @@ def dashboard_stats(
 ):
     today = report_date or datetime.now(TZ).date()
     week_start = today - timedelta(days=6)
+    day_start, day_end = _day_bounds(today)
     with transaction() as (_, cursor):
         cursor.execute("SELECT COUNT(*) AS total FROM employees WHERE status = 'active'")
         total = cursor.fetchone()["total"]
         cursor.execute(
-             """SELECT SUM(CASE WHEN a.entry_time IS NOT NULL THEN 1 ELSE 0 END) AS present,
-                 SUM(CASE WHEN a.entry_time IS NOT NULL AND a.exit_time IS NULL THEN 1 ELSE 0 END) AS working,
-                 SUM(CASE WHEN a.status = 'late' THEN 1 ELSE 0 END) AS late
-             FROM attendance a JOIN employees e ON e.id = a.employee_id
-             WHERE a.date = %s AND e.status = 'active'""",
+            """SELECT SUM(CASE WHEN a.entry_time IS NOT NULL THEN 1 ELSE 0 END) AS present,
+                      SUM(CASE WHEN a.entry_time IS NOT NULL AND a.exit_time IS NULL THEN 1 ELSE 0 END) AS working,
+                      SUM(CASE WHEN a.status = 'late' THEN 1 ELSE 0 END) AS late
+               FROM attendance a JOIN employees e ON e.id = a.employee_id
+               WHERE a.date = %s AND e.status = 'active'""",
             (today,),
         )
         counts = cursor.fetchone()
         cursor.execute(
             """SELECT SUM(CASE WHEN action = 'entry' THEN 1 ELSE 0 END) AS entries,
                       SUM(CASE WHEN action = 'exit' THEN 1 ELSE 0 END) AS exits
-               FROM attendance_log WHERE DATE(timestamp) = %s""",
-            (today,),
+               FROM attendance_log WHERE timestamp >= %s AND timestamp < %s""",
+            (day_start, day_end),
         )
         event_counts = cursor.fetchone()
         cursor.execute(
-            """SELECT DATE(date) AS day, COUNT(*) AS present
+            """SELECT date AS day, COUNT(*) AS present
                FROM attendance WHERE date BETWEEN %s AND %s AND entry_time IS NOT NULL
-               GROUP BY DATE(date) ORDER BY day""",
+               GROUP BY date ORDER BY day""",
             (week_start, today),
         )
         weekly = cursor.fetchall()
@@ -319,8 +357,8 @@ def dashboard_stats(
             """SELECT l.id, l.timestamp, l.action, l.confidence,
                       e.id AS employee_id, e.employee_code, e.name, e.department
                FROM attendance_log l JOIN employees e ON e.id = l.employee_id
-               WHERE DATE(l.timestamp) = %s ORDER BY l.id DESC LIMIT 8""",
-            (today,),
+               WHERE l.timestamp >= %s AND l.timestamp < %s ORDER BY l.id DESC LIMIT 8""",
+            (day_start, day_end),
         )
         recent = cursor.fetchall()
         cursor.execute(
@@ -345,6 +383,12 @@ def dashboard_stats(
         "recent_events": recent,
         "today_employees": daily,
     }
+
+
+_EMPLOYEE_COLUMNS = (
+    "id, employee_code, name, department, position, phone, status, created_at, face_registered_at, "
+    "(face_encoding IS NOT NULL AND LENGTH(face_encoding) > 0) AS has_face"
+)
 
 
 @app.get("/api/employees")
@@ -373,7 +417,7 @@ def list_employees(
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     with transaction() as (_, cursor):
         cursor.execute(
-            "SELECT id, employee_code, name, department, position, phone, status, created_at, face_registered_at, face_encoding FROM employees" + where + " ORDER BY name",
+            "SELECT " + _EMPLOYEE_COLUMNS + " FROM employees" + where + " ORDER BY name",
             tuple(params),
         )
         rows = cursor.fetchall()
@@ -399,7 +443,7 @@ def create_employee(payload: EmployeeCreate, _: dict = Depends(require_roles("ad
 def get_employee(employee_id: int, _: dict = Depends(require_roles("admin", "operator", "reports"))):
     with transaction() as (_, cursor):
         cursor.execute(
-            "SELECT id, employee_code, name, department, position, phone, status, created_at, face_registered_at, face_encoding FROM employees WHERE id = %s",
+            "SELECT " + _EMPLOYEE_COLUMNS + " FROM employees WHERE id = %s",
             (employee_id,),
         )
         row = cursor.fetchone()
@@ -415,6 +459,8 @@ def update_employee(employee_id: int, payload: EmployeeUpdate, _: dict = Depends
         raise HTTPException(status_code=400, detail="O'zgartirish uchun maydon berilmadi.")
     allowed = {"employee_code", "name", "department", "position", "phone", "status"}
     fields = [key for key in changes if key in allowed]
+    if not fields:
+        raise HTTPException(status_code=400, detail="O'zgartirish uchun ruxsat etilgan maydon yo'q.")
     sql = ", ".join(f"{field} = %s" for field in fields)
     with transaction() as (_, cursor):
         try:
@@ -430,10 +476,12 @@ def update_employee(employee_id: int, payload: EmployeeUpdate, _: dict = Depends
 
 @app.delete("/api/employees/{employee_id}")
 def delete_employee(employee_id: int, _: dict = Depends(require_roles("admin"))):
+    # Davomat tarixi saqlanib qolishi uchun xodim o'chirilmaydi, faqat nofaol qilinadi.
     with transaction() as (_, cursor):
-        cursor.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
-        if cursor.rowcount == 0:
+        cursor.execute("SELECT id FROM employees WHERE id = %s", (employee_id,))
+        if cursor.fetchone() is None:
             raise HTTPException(status_code=404, detail="Xodim topilmadi.")
+        cursor.execute("UPDATE employees SET status = 'inactive' WHERE id = %s", (employee_id,))
     return {"ok": True}
 
 
@@ -443,13 +491,13 @@ async def register_face(
     image: UploadFile = File(...),
     _: dict = Depends(require_roles("admin")),
 ):
-    image_bytes = await image.read(5 * 1024 * 1024 + 1)
+    if not await run_in_threadpool(_employee_exists, employee_id):
+        raise HTTPException(status_code=404, detail="Xodim topilmadi.")
+    image_bytes = await _read_image(image)
     try:
         result = await run_in_threadpool(analyze_image, image_bytes, True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if not await run_in_threadpool(_employee_exists, employee_id):
-        raise HTTPException(status_code=404, detail="Xodim topilmadi.")
     duplicate = await run_in_threadpool(find_duplicate, result.encoding, employee_id)
     if duplicate:
         raise HTTPException(status_code=409, detail="Bu yuz boshqa xodim uchun ro'yxatdan o'tgan.")
@@ -462,8 +510,9 @@ async def inspect_face(
     image: UploadFile = File(...),
     _: dict = Depends(require_roles("admin", "operator")),
 ):
+    image_bytes = await _read_image(image)
     try:
-        result = await run_in_threadpool(analyze_image, await image.read(5 * 1024 * 1024 + 1))
+        result = await run_in_threadpool(analyze_image, image_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"face_count": len(result.boxes), "boxes": result.boxes}
@@ -472,18 +521,19 @@ async def inspect_face(
 @app.post("/api/attendance/camera-session/start")
 def start_camera_session(user: dict = Depends(require_roles("admin", "operator"))):
     session_id = str(uuid4())
+    now = monotonic()
     with _sessions_lock:
-        _sessions[session_id] = (user["id"], monotonic() + 1800, 0.0)
+        _purge_expired_sessions(now)
+        _sessions[session_id] = (user["id"], now + SESSION_TTL, 0.0)
     return {"session_id": session_id, "frame_interval_ms": settings.frame_interval_ms}
 
 
 @app.post("/api/attendance/camera-session/stop")
-def stop_camera_session(payload: dict, user: dict = Depends(require_roles("admin", "operator"))):
-    session_id = payload.get("session_id")
+def stop_camera_session(payload: CameraStop, user: dict = Depends(require_roles("admin", "operator"))):
     with _sessions_lock:
-        session = _sessions.get(session_id)
+        session = _sessions.get(payload.session_id)
         if session and session[0] == user["id"]:
-            _sessions.pop(session_id, None)
+            _sessions.pop(payload.session_id, None)
     return {"ok": True}
 
 
@@ -494,8 +544,9 @@ async def recognize_attendance(
     user: dict = Depends(require_roles("admin", "operator")),
 ):
     _ensure_camera_session(request.headers.get("X-Camera-Session"), user["id"], enforce_interval=True)
+    image_bytes = await _read_image(image)
     try:
-        result = await run_in_threadpool(analyze_image, await image.read(5 * 1024 * 1024 + 1), True)
+        result = await run_in_threadpool(analyze_image, image_bytes, True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     employee = await run_in_threadpool(match_employee, result.encoding)
@@ -607,10 +658,9 @@ def report_export(
     writer = DictWriter(output, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow(row)
-    output.seek(0)
-    return StreamingResponse(
-        iter(["\ufeff" + output.getvalue()]),
+        writer.writerow({key: _csv_safe(value) for key, value in row.items()})
+    return Response(
+        content="\ufeff" + output.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename=attendance-{start_date}-{end_date}.csv"},
     )
